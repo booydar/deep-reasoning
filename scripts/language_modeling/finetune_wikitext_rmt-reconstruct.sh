@@ -38,7 +38,7 @@ do
 
 SAMPLE_SIZE=$((MAX_N_SEGMENTS*SEGMENT_SIZE)) # length of task sample in tokens
 GRAD_ACC_STEPS=$(($TBS/($BS*$NP)))
-SCHEDULER=linear
+SCHEDULER=wikitext
 
 for N in 1
 do

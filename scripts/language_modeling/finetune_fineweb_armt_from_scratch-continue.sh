@@ -2,43 +2,47 @@
 # CUDA_VISIBLE_DEVICES=1,2 NP=2 ./finetune_babilong_baseline.sh
 set -e
 
-SCRIPT_DIR=/home/jovyan/bulatov/rmt/reasoning/deep-reasoning
-RUNS_DIR=/home/jovyan/bulatov/rmt/runs
+SCRIPT_DIR=/workspace-SR006.nfs2/bulatov/rmt/reasoning/deep-reasoning
+RUNS_DIR=/workspace-SR006.nfs2/bulatov/rmt/runs
+
+# SCRIPT_DIR=/home/jovyan/bulatov/rmt/reasoning/deep-reasoning
+# RUNS_DIR=/home/jovyan/bulatov/rmt/runs
 
 CUBLAS_WORKSPACE_CONFIG=:4096:2
 CUDA_LAUNCH_BLOCKING=1
 
 MODEL_TYPE=decoder
-MEMORY_CELL=modeling_rmt.language_modeling:MemoryCell
-RECURRENT_WRAPPER=modeling_rmt.language_modeling:RecurrentWrapper
+MEMORY_CELL=modeling_amt.language_modeling:AssociativeMemoryCell
+RECURRENT_WRAPPER=modeling_amt.language_modeling:AssociativeRecurrentWrapper
 BACKBONE_CLS=transformers:AutoModelForCausalLM
-DATASET_NAME=wikitext
+DATASET_NAME=fineweb-edu
 METRIC=exact_match
 
-MODEL_NAME=gpt2  # backbone model
-MODEL_PATH=gpt2
+MODEL_NAME=SmolLM2-135M
+FROM_PRETRAINED=HuggingFaceTB/SmolLM2-135M
 
-TASK_DATASET=Salesforce/wikitext
+TASK_DATASET=HuggingFaceFW/fineweb-edu
 
-ITERS=50000
+ITERS=100000
 TBS=256
 BS=32
 
-for LR in 1e-04
+for LR in 3e-03
 do
 
 for SEGMENT_SIZE in 512 # size of one segment in tokens
 do
 
-for MAX_N_SEGMENTS in 1
+for MAX_N_SEGMENTS in 2
 do
 
-for MEMORY_SIZE in 16
+for MEMORY_SIZE in 32
 do
+D_MEM=32
 
 SAMPLE_SIZE=$((MAX_N_SEGMENTS*SEGMENT_SIZE)) # length of task sample in tokens
 GRAD_ACC_STEPS=$(($TBS/($BS*$NP)))
-SCHEDULER=linear
+SCHEDULER=constant
 
 for N in 1
 do
@@ -53,10 +57,12 @@ echo SAMPLE_SIZE $SAMPLE_SIZE MODEL_NAME $MODEL_NAME  LR $LR N $N
 echo gradient accumulation steps $GRAD_ACC_STEPS
 
 # python run_finetuning_lm_rmt.py \
-accelerate launch --num_processes $NP --config_file $ACCEL_CONFIG --main_process_port 29003 $MAIN_SCRIPT \
+accelerate launch --num_processes $NP --config_file $ACCEL_CONFIG --main_process_port 29002 $MAIN_SCRIPT \
         --task_name $TASK_DATASET \
-        --output_dir ${RUNS_DIR}/test/${DATASET_NAME}-reconstruct/$MODEL_NAME/${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_bs${TBS}_bptt-${K2}/run_$N \
-        --from_pretrained $MODEL_PATH \
+        --output_dir ${RUNS_DIR}/${DATASET_NAME}/$MODEL_NAME-armt/${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_bs${TBS}_bptt-${K2}-from_scratch-continue/run_$N \
+        --checkpoint /workspace-SR006.nfs2/bulatov/rmt/runs/fineweb-edu/SmolLM2-135M-armt/constant_adamw_wd1e-03_2x512_mem32_bs256_bptt--1/run_1/checkpoint-8000 \
+        --model_cfg $FROM_PRETRAINED \
+        --tokenizer $FROM_PRETRAINED \
         --model_type $MODEL_TYPE \
         --memory_cell_cls $MEMORY_CELL \
         --recurrent_wrapper_cls $RECURRENT_WRAPPER \
@@ -66,11 +72,13 @@ accelerate launch --num_processes $NP --config_file $ACCEL_CONFIG --main_process
         --val_sample_size $SAMPLE_SIZE \
         --num_mem_tokens $MEMORY_SIZE \
         --max_n_segments $MAX_N_SEGMENTS\
+        --d_mem $D_MEM \
         --per_device_train_batch_size $BS --gradient_accumulation_steps $(($TBS/($BS*$NP))) \
         --max_steps $ITERS \
         --metric_for_best_model "eval_loss" \
         --greater_is_better false \
         --save_total_limit 1 \
+        --early_stopping_patience 25 \
         --k2 $K2 \
         --optimizer AdamW  --weight_decay 0.01 \
         --learning_rate ${LR} --lr_scheduler_type $SCHEDULER --warmup_steps $(($ITERS/10)) \

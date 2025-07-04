@@ -2,8 +2,8 @@
 # CUDA_VISIBLE_DEVICES=1,2 NP=2 ./finetune_babilong_baseline.sh
 set -e
 
-SCRIPT_DIR=/home/jovyan/bulatov/rmt/reasoning/deep-reasoning
-RUNS_DIR=/home/jovyan/bulatov/rmt/runs
+SCRIPT_DIR=/workspace-SR006.nfs2/bulatov/rmt/reasoning/deep-reasoning
+RUNS_DIR=/workspace-SR006.nfs2/bulatov/rmt/runs
 
 CUBLAS_WORKSPACE_CONFIG=:4096:2
 CUDA_LAUNCH_BLOCKING=1
@@ -20,17 +20,17 @@ MODEL_PATH=gpt2
 
 TASK_DATASET=Salesforce/wikitext
 
-ITERS=50000
+ITERS=250000
 TBS=256
 BS=32
 
-for LR in 1e-04
+for LR in 3e-04
 do
 
 for SEGMENT_SIZE in 512 # size of one segment in tokens
 do
 
-for MAX_N_SEGMENTS in 1
+for MAX_N_SEGMENTS in 2
 do
 
 for MEMORY_SIZE in 16
@@ -38,7 +38,7 @@ do
 
 SAMPLE_SIZE=$((MAX_N_SEGMENTS*SEGMENT_SIZE)) # length of task sample in tokens
 GRAD_ACC_STEPS=$(($TBS/($BS*$NP)))
-SCHEDULER=linear
+SCHEDULER=constant
 
 for N in 1
 do
@@ -53,10 +53,11 @@ echo SAMPLE_SIZE $SAMPLE_SIZE MODEL_NAME $MODEL_NAME  LR $LR N $N
 echo gradient accumulation steps $GRAD_ACC_STEPS
 
 # python run_finetuning_lm_rmt.py \
-accelerate launch --num_processes $NP --config_file $ACCEL_CONFIG --main_process_port 29003 $MAIN_SCRIPT \
+accelerate launch --num_processes $NP --config_file $ACCEL_CONFIG --main_process_port 29002 $MAIN_SCRIPT \
         --task_name $TASK_DATASET \
-        --output_dir ${RUNS_DIR}/test/${DATASET_NAME}-reconstruct/$MODEL_NAME/${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_bs${TBS}_bptt-${K2}/run_$N \
-        --from_pretrained $MODEL_PATH \
+        --output_dir ${RUNS_DIR}/${DATASET_NAME}/$MODEL_NAME/${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_bs${TBS}_bptt-${K2}-from_scratch/run_$N \
+        --model_cfg $MODEL_NAME \
+        --tokenizer $MODEL_NAME \
         --model_type $MODEL_TYPE \
         --memory_cell_cls $MEMORY_CELL \
         --recurrent_wrapper_cls $RECURRENT_WRAPPER \
