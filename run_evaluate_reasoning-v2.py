@@ -118,7 +118,8 @@ if __name__ == '__main__':
                 preds_full = model.generate(
                     **task,
                     max_new_tokens=args.max_new_tokens,
-                    pad_token_id=eos[0]
+                    pad_token_id=eos[0],
+                    do_sample=False
                 )
 
             labels = collated['labels']
@@ -147,21 +148,19 @@ if __name__ == '__main__':
                 all_preds_cot.append(pred_cot_tokens)
                 all_labels_cot.append(lab_cot_tokens)
 
-                pred_and_tokens = pred_tokens[ans_start_index_p+1:ans_end_index_p]
+                pred_ans_tokens = pred_tokens[ans_start_index_p+1:ans_end_index_p]
                 lab_ans_tokens = lab_tokens[ans_start_index_l+1:ans_end_index_l]
 
-                all_preds_ans.append(pred_and_tokens)
+                all_preds_ans.append(pred_ans_tokens)
                 all_labels_ans.append(lab_ans_tokens)
 
                 all_preds.append(pred_tokens)
                 all_labels.append(lab_tokens)
 
-            cot_correct = [p == l for p, l in zip(all_preds_cot, all_labels_cot)]
-            ans_correct = [p == l for p, l in zip(all_preds_ans, all_labels_ans)]
-
         cot_correct = [p == l for p, l in zip(all_preds_cot, all_labels_cot)]
         ans_correct = [p == l for p, l in zip(all_preds_ans, all_labels_ans)]
-        res = {'accuracy_cot': np.mean(cot_correct), 'accuracy_ans': np.mean(ans_correct)}
+
+        res = {'accuracy_cot': float(np.mean(cot_correct)), 'accuracy_ans': float(np.mean(ans_correct))}
     
         return res
 

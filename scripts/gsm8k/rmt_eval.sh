@@ -13,15 +13,19 @@ MEMORY_CELL=modeling_rmt.language_modeling:MemoryCell
 RECURRENT_WRAPPER=modeling_rmt.experimental:RecurrentWrapperNoSegmentationGenerate
 BACKBONE_CLS=transformers:AutoModelForCausalLM
 
-export CUDA_VISIBLE_DEVICES="3"
+export CUDA_VISIBLE_DEVICES="0"
 NP=1
 TASK_NAME=gsm8k
-CHECKPOINT=/home/user33/kashurin/RMT_SmolLM2-135M/cot/checkpoint-2200/pytorch_model.bin
+CHECKPOINT=/home/user33/kashurin/RMT_SmolLM2-135M/cot_fixed_pad/checkpoint-2700/pytorch_model.bin
+# CHECKPOINT=/home/user33/kashurin/RMT_SmolLM2-135M/cot/checkpoint-3300/pytorch_model.bin
+# CHECKPOINT=/home/user33/kashurin/RMT_SmolLM2-135M/cot_mode_single_reasoning-corrected/checkpoint-3350/pytorch_model.bin
+# CHECKPOINT=/home/user33/kashurin/RMT_SmolLM2-135M/cot_mode_overlap_reasoning/checkpoint-2100/pytorch_model.bin
 MODEL_ID=HuggingFaceTB/SmolLM2-135M
 MODEL_NAME=SmolLM2-135M
 INPUT_SEQ_LEN=64
 MEMORY_SIZE=16
 MAX_N_SEGMENTS=10
+MAX_NEW_TOKENS=100
 
 BATCH_SIZE=1
 MAX_COT_STEPS=$((MAX_N_SEGMENTS-2))
@@ -39,6 +43,7 @@ python $EVAL_SCRIPT \
     --dataset_name "booydar/gsm8k" \
     --task_name $TASK_NAME \
     --num_mem_tokens $MEMORY_SIZE \
+    --max_new_tokens $MAX_NEW_TOKENS \
     --max_n_segments $MAX_N_SEGMENTS \
     --max_cot_steps $MAX_COT_STEPS \
     --batch_size $BATCH_SIZE \

@@ -40,7 +40,7 @@ for N in 1; do
         accelerate launch --num_processes $NP --config_file $ACCEL_CONFIG $MAIN_SCRIPT \
         --task_name $TASK_NAME \
         --dataset_name "booydar/gsm8k" \
-        --output_dir ${RUNS_DIR}/${TASK_NAME}/${FULL_MODEL_NAME}/${MAX_N_SEGMENTS}x${INPUT_SEQ_LEN}_mem${MEMORY_SIZE}_BS${BS}_LR${LR}-cot-sft \
+        --output_dir ${RUNS_DIR}/${TASK_NAME}/${FULL_MODEL_NAME}/${MAX_N_SEGMENTS}x${INPUT_SEQ_LEN}_mem${MEMORY_SIZE}_BS${BS}_LR${LR}-cot-fixed_padding\
         --model_cpt $MODEL_CPT \
         --from_pretrained $MODEL_ID \
         --model_type $MODEL_TYPE \

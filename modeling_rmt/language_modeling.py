@@ -39,7 +39,11 @@ class MemoryCell(torch.nn.Module):
             memory_state = self.set_memory(input_ids.shape)
 
         seg_kwargs = self.process_input(input_ids, memory_state, attention_mask=attention_mask, write_mem=False)
-        out = self.model.generate(inputs_embeds=seg_kwargs['inputs_embeds'], attention_mask=seg_kwargs['attention_mask'], **generate_kwargs)
+        out = self.model.generate(
+            inputs_embeds=seg_kwargs['inputs_embeds'],
+            attention_mask=seg_kwargs['attention_mask'],
+            **generate_kwargs
+        )
         return out
 
     def process_input(self, input_ids, memory_state, write_mem, **kwargs):

@@ -27,6 +27,7 @@ parser.add_argument('--recurrent_wrapper_cls', type=str, default=None, help='rec
 parser.add_argument('--num_mem_tokens', type=int, default=None, help='number of memory tokens.')
 parser.add_argument('--max_n_segments', type=int, default=1, help='maximal segment number')
 parser.add_argument('--max_cot_steps', type=int, default=None, help='Maximum number of cot steps')
+parser.add_argument('--max_new_tokens', type=int, default=100, help='Maximum number of new tokens to generate')
 
 parser.add_argument('--batch_size', type=int, default=16, help='Batch size for evaluation')
 parser.add_argument('--device', type=str, default='cuda', help='Device for evaluation')
@@ -141,42 +142,119 @@ if __name__ == '__main__':
 
         for start_ind in tqdm(range(0, len(dataset), bs)):
             batch = dataset.select(range(start_ind, min(len(dataset), start_ind + bs)))
+
             collated = collate_fn(batch)
             task = collated['segments'][0]
             task = {k:v.to(device) for k,v in task.items()}
 
+            task_length = task['input_ids'].shape[1]
+
             with torch.no_grad():
-                gen_out = model.generate([task], max_new_tokens=max_new_tokens, pad_token_id=eos[0])
+                gen_out = model.generate(
+                    [task],
+                    max_new_tokens=args.max_new_tokens,
+                    pad_token_id=eos[0],
+                    do_sample=False
+                )
+
             preds_full = torch.cat(gen_out, dim=1)
             labels = collated['labels']
-            labels_masks = labels > 0
-            labels_full = [lab[m] for lab, m in zip(labels, labels_masks)]
+            for i, (lab_tokens, pred_tokens) in enumerate(zip(labels, preds_full)):
+                labels_mask = lab_tokens != -100
+                lab_tokens = lab_tokens[labels_mask].tolist()
+                lab_tokens = [t for t in lab_tokens if t != bos[0]]
 
-            for lab_tokens, pred_tokens in zip(labels_full, preds_full):
-                lab_tokens = [t.item() for t in lab_tokens if t != bos[0]]
+                pred_tokens = pred_tokens.tolist()
+                pred_tokens = [t for t in pred_tokens if t != bos[0]]
+                
                 ans_start_index_l = max(i for i, x in enumerate(lab_tokens) if x == ans[0])
+
                 if ans[0] in pred_tokens:
-                    ans_start_index_p = max(i for i, x in enumerate(pred_tokens) if x == ans[0])
+                    ans_start_index_p = max(i for i, x in enumerate(pred_tokens) if x in [ans[0], think[0]])
                 else:
                     ans_start_index_p = ans_start_index_l
-                pred_cot_tokens = pred_tokens[:ans_start_index_p].tolist()
+
+
+                pred_cot_tokens = pred_tokens[:ans_start_index_p]
                 lab_cot_tokens = lab_tokens[:ans_start_index_l]
+
                 all_preds_cot.append(pred_cot_tokens)
                 all_labels_cot.append(lab_cot_tokens)
-                all_preds_ans.append(pred_tokens[ans_start_index_p:].tolist())
-                all_labels_ans.append(lab_tokens[ans_start_index_l:])
-                all_preds.append(pred_tokens.tolist())
+
+                pred_and_tokens = pred_tokens[ans_start_index_p+1:]
+                lab_ans_tokens = lab_tokens[ans_start_index_l+1:]
+
+                all_preds_ans.append(pred_and_tokens)
+                all_labels_ans.append(lab_ans_tokens)
+
+                all_preds.append(pred_tokens)
                 all_labels.append(lab_tokens)
+
         cot_correct = [p == l for p, l in zip(all_preds_cot, all_labels_cot)]
         ans_correct = [p == l for p, l in zip(all_preds_ans, all_labels_ans)]
-        res = {'accuracy_cot': np.mean(cot_correct), 'accuracy_ans': np.mean(ans_correct)}
+
+        res = {'accuracy_cot': float(np.mean(cot_correct)), 'accuracy_ans': float(np.mean(ans_correct))}
         return res
+
+    # def evaluate(model, dataset, device='cpu', bs=16, max_new_tokens=25):
+    #     acc_cot, acc_ans = [], []
+    #     for start_ind in tqdm(range(0, len(dataset), bs)):
+    #         batch = dataset.select(range(start_ind, min(len(dataset), start_ind + bs)))
+
+    #         collated = collate_fn(batch)
+    #         task = collated['segments'][0]
+    #         task = {k:v.to(device) for k,v in task.items()}
+
+    #         task_length = task['input_ids'].shape[1]
+
+    #         with torch.no_grad():
+    #             gen_out = model.generate(
+    #                 [task],
+    #                 max_new_tokens=args.max_new_tokens,
+    #                 pad_token_id=eos[0],
+    #                 do_sample=False
+    #             )
+
+    #         preds_full = torch.cat(gen_out, dim=1)
+    #         labels = collated['labels']
+
+    #         labels_masks = labels > 0
+    #         preds_full = [p[m] for p, m in zip(preds_full, labels_masks)]
+    #         labels_full = [lab[m] for lab, m in zip(labels, labels_masks)]
+
+    #         special_tokens = {ans[0], bos[0]}
+    #         for lab_tokens, pred_tokens in zip(labels_full, preds_full):
+    #             ans_start_index = max(i for i, x in enumerate(lab_tokens) if x == ans[0])
+
+    #             pred_cot_tokens = pred_tokens[:ans_start_index].tolist()
+    #             lab_cot_tokens = lab_tokens[:ans_start_index].tolist()
+
+    #             cot_correct = [p == l for p, l in zip(pred_cot_tokens, lab_cot_tokens) if l not in special_tokens]
+    #             acc_cot.append(all(cot_correct))
+
+    #             pred_ans_tokens = pred_tokens[ans_start_index:].tolist()
+    #             lab_ans_tokens = lab_tokens[ans_start_index:].tolist()
+
+    #             ans_correct = [p == l for p, l in zip(pred_ans_tokens, lab_ans_tokens) if l not in special_tokens]
+    #             acc_ans.append(all(ans_correct))
+
+
+    #     res = {'accuracy_cot': float(np.mean(acc_cot)), 'accuracy_ans': float(np.mean(acc_ans))}
+    #     return res
+
 
     logger.info("Starting evaluation...")
 
     model.to(device)
     model.eval()
 
-    results = evaluate(model, valid_dataset, device=device, bs=args.batch_size)
+    results = evaluate(
+        model,
+        valid_dataset.select(range(0, 100)),
+        device=device,
+        bs=args.batch_size,
+        max_new_tokens=args.max_new_tokens
+    )
+
     logger.info(f"Evaluation results: {results}")
     print("Evaluation results:", results) 

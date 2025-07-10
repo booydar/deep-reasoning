@@ -47,8 +47,9 @@ class MemoryCellSmart(torch.nn.Module):
         else:
             raise ValueError("inputs_embeds is not supported for memory cells") # test "if"
 
-        inputs_embeds = self.put_tensor_by_mask(inputs_embeds, memory_state, read_mem_mask)
-        if write_mem:
+        if read_mem_mask is not None:
+            inputs_embeds = self.put_tensor_by_mask(inputs_embeds, memory_state, read_mem_mask)
+        if write_mem and write_mem_mask is not None:
             inputs_embeds = self.put_tensor_by_mask(inputs_embeds, memory_state, write_mem_mask)
         
         seg_kwargs['input_ids'] = None
@@ -234,13 +235,14 @@ class RecurrentWrapper(torch.nn.Module):
         return generated_segments
 
     def generate_segment(self, memory_state, **kwargs):
-        input_ids = self.get_bos_tensor(memory_state)
+        input_ids, read_mem_mask = self.get_bos_tensor(memory_state)
         attention_mask = torch.ones_like(input_ids).bool()
 
         generated = self.memory_cell.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             memory_state=memory_state,
+            read_mem_mask=read_mem_mask,
             eos_token_id=[
                 self.rmt_config['eos_token_id'],
                 self.rmt_config['think_token_id'],
@@ -250,15 +252,22 @@ class RecurrentWrapper(torch.nn.Module):
         )
 
         # Update memory state from generation
-        fwd_inputs = torch.cat((input_ids, generated), dim=1)[:, :-1]
+        fwd_inputs = torch.cat((input_ids, generated, memory_state), dim=1)
         _, memory_state = self.memory_cell(input_ids=fwd_inputs, memory_state=memory_state)
 
         return generated, memory_state
 
     def get_bos_tensor(self, memory_state):
+        mem = self.rmt_config["mem_token_id"]
         bos = self.rmt_config["bos_token_id"]
+        mem_tensor = torch.tensor([mem] * self.memory_cell.num_mem_tokens).reshape(1, -1)
+        mem_tensor = mem_tensor.repeat(memory_state.shape[0], 1)
         bos_tensor = torch.tensor([bos] * memory_state.shape[0]).reshape(-1, 1)
-        return bos_tensor.to(memory_state.device)
+        input_tensor = torch.cat([mem_tensor, bos_tensor], dim=1)
+
+        read_mem_mask = torch.zeros(input_tensor.shape, dtype=torch.bool)
+        read_mem_mask[:, :self.memory_cell.num_mem_tokens] = True
+        return input_tensor.to(memory_state.device), read_mem_mask.to(memory_state.device)
 
     def all_done(self, generated_segments):
         eos = self.rmt_config['eos_token_id']
@@ -469,7 +478,8 @@ class RecurrentWrapperNoSegmentationGenerate(RecurrentWrapperNoSegmentation):
             cell_out, memory_state = self.memory_cell(
                 input_ids=segment['input_ids'],
                 attention_mask=segment['attention_mask'],
-                memory_state=memory_state, output_hidden_states=True
+                memory_state=memory_state,
+                output_hidden_states=True
             )
 
         generated_segments = []
@@ -490,7 +500,11 @@ class RecurrentWrapperNoSegmentationGenerate(RecurrentWrapperNoSegmentation):
             input_ids=input_ids,
             attention_mask=attention_mask,
             memory_state=memory_state,
-            eos_token_id=[self.rmt_config['eos_token_id'], self.rmt_config['think_token_id'], self.rmt_config['answer_token_id']],
+            eos_token_id=[
+                self.rmt_config['eos_token_id'],
+                self.rmt_config['think_token_id'],
+                self.rmt_config['answer_token_id']
+            ],
             **kwargs
         )
 
