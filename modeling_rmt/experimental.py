@@ -509,7 +509,7 @@ class RecurrentWrapperNoSegmentationGenerate(RecurrentWrapperNoSegmentation):
         )
 
         # Update memory state from generation
-        fwd_inputs = torch.cat((input_ids, generated), dim=1)[:, :-1]
+        fwd_inputs = torch.cat((input_ids, generated), dim=1)
         _, memory_state = self.memory_cell(input_ids=fwd_inputs, memory_state=memory_state)
 
         return generated, memory_state
