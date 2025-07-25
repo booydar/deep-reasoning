@@ -299,7 +299,7 @@ if __name__ == '__main__':
         model = model_cls(config=model_cfg)
 
         logger.info(f'Loading pretrained model: {args.from_pretrained}')
-        base_model = model_cls.from_pretrained(args.from_pretrained, use_safetensors=False)
+        base_model = model_cls.from_pretrained(args.from_pretrained)#, use_safetensors=False)
 
         model.load_state_dict(base_model.state_dict(), strict=False)
         del base_model
@@ -317,7 +317,7 @@ if __name__ == '__main__':
                                                   torch_dtype=torch.bfloat16,
                                                   trust_remote_code=True)
             else:
-                model = model_cls.from_pretrained(args.from_pretrained, use_safetensors=False)
+                model = model_cls.from_pretrained(args.from_pretrained)#, use_safetensors=False)
     if args.use_lora:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -436,11 +436,9 @@ if __name__ == '__main__':
     training_args_dict['bf16'] = True
     training_args_dict['label_names'] = ['labels']
     training_args_dict['evaluation_strategy'] = 'steps'
-    if training_args_dict.get('per_device_train_batch_size') == 1:
-        training_args_dict['per_device_eval_batch_size'] = training_args_dict.get('per_device_train_batch_size')
-    else:
-        training_args_dict['per_device_eval_batch_size'] = training_args_dict.get('per_device_train_batch_size') // 2
-    training_args_dict['eval_accumulation_steps'] = 32
+    eval_batch_size = training_args_dict.get('per_device_train_batch_size') // 16
+    training_args_dict['per_device_eval_batch_size'] = max(eval_batch_size, 1)
+    training_args_dict['eval_accumulation_steps'] = 16
     if args.d_mem is None:
         # for now, gradient checkpointing doesn't supported for ARMT
         training_args_dict['gradient_checkpointing'] = True
