@@ -23,6 +23,8 @@ from transformers import AutoConfig, AutoTokenizer, HfArgumentParser  # noqa: E4
 # from lm_experiments_tools.utils import get_cls_by_name, get_optimizer, prepare_run  # noqa: E402
 from lm_experiments_tools.utils import get_cls_by_name
 
+from utils.reasoning import make_segment, split_cot
+
 logger_fmt = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 logging.basicConfig(format=logger_fmt, level=logging.INFO)
 logger = logging.getLogger('')
@@ -78,6 +80,7 @@ parser.add_argument('--truncate_only_train', action='store_true',
 parser.add_argument('--use_cot', action='store_true', help='use chain of thought examples')
 parser.add_argument('--answer_loss_weight', type=float, default=1, help='weight of answer in model loss')
 parser.add_argument('--max_cot_steps', type=int, default=None, help='maximum number of cot steps')
+parser.add_argument('--n_latent', type=int, default=0, help='number of latent reasoning steps in between segments')
 
 # model args
 parser.add_argument('--from_pretrained', type=str, help='model name in HF Model Hub (default: "")')
@@ -228,17 +231,17 @@ if __name__ == '__main__':
         valid_dataset = valid_dataset.filter(lambda x: x['cot_len'] <= args.max_cot_steps)
         test_dataset = test_dataset.filter(lambda x: x['cot_len'] <= args.max_cot_steps)
         logger.info(f"Filtered ds sizes: {len(train_dataset), len(valid_dataset), len(test_dataset)}")
-    if 'gsm8k' in args.task_name:
-        delim = ">> <<"
-    elif 'multiplication' in args.task_name:
-        delim = ' + '
-    else:
-        raise NotImplementedError(f"Unknown task name {args.task_name}")
 
     id_pad_value = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    think = tokenizer.encode('????')
-    bos = tokenizer.encode('////')
-    ans = tokenizer.encode('!!!!')
+    if 'gpt2' in args.from_pretrained:
+        think = tokenizer.encode('????')
+        bos = tokenizer.encode('////')
+        ans = tokenizer.encode('!!!!')
+    elif 'SmolLM' in args.from_pretrained:
+        bos = [tokenizer.bos_token_id]
+        think = tokenizer.encode("<issue_start>")
+        ans = tokenizer.encode("<issue_closed>")
+
     eos = [tokenizer.eos_token_id]
     if 'gsm8k' in args.task_name:
         delim = ">> <<"
@@ -248,39 +251,60 @@ if __name__ == '__main__':
         raise NotImplementedError(f"Unknown task name {args.task_name}")
 
     def collate_fn(batch):
-        input_ids, labels, labels_mask, attention_mask = [], [], [], []
+        # first, we segment each sample into task, cot steps and labels
+        segments_batch = []
         for sample in batch:
             task, lab, cot = sample['task'], sample['labels'], sample['cot']
             task_tokens = tokenizer.encode(task, add_special_tokens=False)
             labels_tokens = tokenizer.encode(lab, add_special_tokens=False)
-            cot_tokens = tokenizer.encode(cot, add_special_tokens=False)
-
-            if args.use_cot:
-                full_input = task_tokens + think + cot_tokens + ans + labels_tokens + eos
+            if getattr(args, 'use_cot', False):
+                cot_segments = split_cot(cot, by=delim)
             else:
-                full_input = task_tokens + ans + labels_tokens + eos
-            inp_ids = torch.tensor(full_input)
-            input_ids.append(inp_ids)
+                cot_segments = [cot]
+            cot_segment_tokens = tokenizer.batch_encode_plus(cot_segments, add_special_tokens=False)['input_ids']
 
-            lab = torch.tensor(full_input)
-            lab[:len(task_tokens)] = -100
-            labels.append(lab)
+            segments = []
+            segments.append(make_segment(bos + task_tokens + think, loss=False))
+            for _ in range(args.n_latent):
+                segments.append(make_segment(bos + think, loss=False))
+            for segment in cot_segment_tokens[:-1]:
+                segments.append(make_segment(bos + segment + think, loss=True))
+                for _ in range(args.n_latent):
+                    segments.append(make_segment(bos + think, loss=False))
+            segments.append(make_segment(bos + cot_segment_tokens[-1] + ans, loss=True))
+            for _ in range(args.n_latent):
+                segments.append(make_segment(bos + ans, loss=False))
 
-            lab_mask = torch.ones_like(inp_ids)
-            lab_mask[:len(task_tokens)] = 0
-            labels_mask.append(lab_mask)
-            attention_mask.append(torch.ones_like(inp_ids))
+            segments.append(make_segment(bos + labels_tokens + eos, loss=True))
+            segments_batch.append(segments)
 
-        input_ids = pad_sequence(input_ids, padding_value=id_pad_value, batch_first=True)
-        attention_mask = pad_sequence(attention_mask, padding_value=0, batch_first=True)
-        labels = pad_sequence(labels, padding_value=id_pad_value, batch_first=True)
-        labels_mask = pad_sequence(labels_mask, padding_value=0, batch_first=True)
+        # if some samples have less segments than others, we pad them with empty segments
+        num_segments = max(len(segments) for segments in segments_batch)
+        for segments in segments_batch:
+            if len(segments) < num_segments:
+                segments.extend([make_segment(eos, loss=False)] * (num_segments - len(segments)))
 
-        collated = {'input_ids': input_ids,
-                    'labels': labels,
-                    'attention_mask': attention_mask,
-                    }
-        return collated
+        # prepare segments for the whole batch
+        batch_segments = []
+        for i in range(num_segments):
+            input_ids = [s[i]['input_ids'] for s in segments_batch]
+            attention_mask = [s[i]['attention_mask'] for s in segments_batch]
+            labels = [s[i]['labels'] for s in segments_batch]
+            labels_mask = [s[i]['labels_mask'] for s in segments_batch]
+
+            input_ids = pad_sequence(input_ids, batch_first=True, padding_value=id_pad_value)
+            attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+            labels = pad_sequence(labels, batch_first=True, padding_value=-100)
+            labels_mask = pad_sequence(labels_mask, batch_first=True, padding_value=False)
+
+            batch_segment = {'input_ids': input_ids,
+                             'attention_mask': attention_mask,
+                             'labels_mask': labels_mask,
+                             'labels': labels
+                             }
+            batch_segments.append(batch_segment)
+        full_labels = torch.cat([s['labels'] for s in batch_segments], dim=1)
+        return {"segments": batch_segments, 'labels': full_labels}
 
     # define model
     # TODO: move model building to separate function
@@ -299,7 +323,7 @@ if __name__ == '__main__':
         model = model_cls(config=model_cfg)
 
         logger.info(f'Loading pretrained model: {args.from_pretrained}')
-        base_model = model_cls.from_pretrained(args.from_pretrained)#, use_safetensors=False)
+        base_model = model_cls.from_pretrained(args.from_pretrained, use_safetensors=False)
 
         model.load_state_dict(base_model.state_dict(), strict=False)
         del base_model
@@ -317,7 +341,7 @@ if __name__ == '__main__':
                                                   torch_dtype=torch.bfloat16,
                                                   trust_remote_code=True)
             else:
-                model = model_cls.from_pretrained(args.from_pretrained)#, use_safetensors=False)
+                model = model_cls.from_pretrained(args.from_pretrained)     # use_safetensors=False)
     if args.use_lora:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -333,7 +357,7 @@ if __name__ == '__main__':
     if args.backbone_cpt:
         backbone_cpt = os.path.join(args.backbone_cpt, "model_best.pth")
         cpt = torch.load(backbone_cpt, map_location='cpu')
-        model.load_state_dict(cpt['model_state_dict'], strict=False)
+        model.load_state_dict(cpt['model_state_dict'], strict=True)
         logger.info(f'Loaded baseline state dict from: {args.backbone_cpt}')
     # Pass memory settings to pretrained model
     if args.num_mem_tokens is not None:
@@ -362,6 +386,7 @@ if __name__ == '__main__':
                                       k2=args.k2,
                                       attend_to_previous_input=args.attend_to_previous_input,
                                       return_all_logits=False,
+                                      answer_loss_weight=args.answer_loss_weight
                                       )
         # load cpt of rmt
         if args.model_cpt:
@@ -381,8 +406,7 @@ if __name__ == '__main__':
                 cpt = torch.load(model_cpt, map_location='cpu')
                 model.load_state_dict(cpt, strict=False)
             logger.info(f'Loaded RMT state dict from: {args.model_cpt}')
-            logger.info('Trainable parameters after adding RMT/ARMT:')
-            logger.info(f'Remaining parameters: {[n for n, p in model.named_parameters() if p.requires_grad]}')
+            logger.info(f'Trainable parameters after adding RMT/ARMT: {[n for n, p in model.named_parameters() if p.requires_grad]}')
     if args.add_lora_to_armt:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -428,17 +452,18 @@ if __name__ == '__main__':
             for param in module.parameters():
                 param.set_(param.contiguous())
     make_contiguous(model)
-    # now switch to HF trainer
     training_args_dict = {key: value for key, value in vars(args).items() if hasattr(SFTConfig('.'), key)}
 
     training_args_dict['remove_unused_columns'] = False
     training_args_dict['save_safetensors'] = False
     training_args_dict['bf16'] = True
     training_args_dict['label_names'] = ['labels']
-    training_args_dict['evaluation_strategy'] = 'steps'
-    eval_batch_size = training_args_dict.get('per_device_train_batch_size') // 16
-    training_args_dict['per_device_eval_batch_size'] = max(eval_batch_size, 1)
-    training_args_dict['eval_accumulation_steps'] = 16
+    training_args_dict['eval_strategy'] = 'steps'
+    if training_args_dict.get('per_device_train_batch_size') == 1:
+        training_args_dict['per_device_eval_batch_size'] = training_args_dict.get('per_device_train_batch_size')
+    else:
+        training_args_dict['per_device_eval_batch_size'] = training_args_dict.get('per_device_train_batch_size') // 2
+    training_args_dict['eval_accumulation_steps'] = 32
     if args.d_mem is None:
         # for now, gradient checkpointing doesn't supported for ARMT
         training_args_dict['gradient_checkpointing'] = True
@@ -450,7 +475,7 @@ if __name__ == '__main__':
 
     if args.num_mem_tokens is not None:
         # fix max_seq_length warning
-        training_args_dict["max_seq_length"] = args.sample_size
+        # training_args_dict["max_seq_length"] = args.sample_size
         model.to(torch.bfloat16)
     training_args = SFTConfig(**training_args_dict)
 
@@ -500,7 +525,7 @@ if __name__ == '__main__':
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=collate_fn,
         compute_metrics=compute_accuracy,
         optimizers=(optimizer, scheduler)
@@ -511,7 +536,7 @@ if __name__ == '__main__':
             early_stopping_patience=args.early_stopping_patience
         )
         trainer.add_callback(early_stopping)
-    start_metrics = trainer.evaluate()
-    logger.info(f"Metrics of initial model: {start_metrics}")
+    # start_metrics = trainer.evaluate()
+    # logger.info(f"Metrics of initial model: {start_metrics}")
     if not args.validate_only:
         trainer.train(resume_from_checkpoint=args.checkpoint)

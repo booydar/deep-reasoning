@@ -211,35 +211,23 @@ if __name__ == '__main__':
                 train_dataset = dataset['train']
                 valid_dataset = dataset["validation"]
                 test_dataset = dataset["test"]
-            train_dataset = train_dataset.map(lambda x: tokenizer(x['text'],
-                                              add_special_tokens=False),
-                                              batched=True,
-                                              batch_size=50_000,)
-            valid_dataset = valid_dataset.map(lambda x: tokenizer(x['text'],
-                                              add_special_tokens=False),
-                                              batched=True,
-                                              batch_size=50_000,)
-            test_dataset = test_dataset.map(lambda x: tokenizer(x['text'],
-                                            add_special_tokens=False),
-                                            batched=True,
-                                            batch_size=50_000,)
+            train_dataset = train_dataset.map(lambda x: tokenizer(x['text'], add_special_tokens=False))
+            valid_dataset = valid_dataset.map(lambda x: tokenizer(x['text'], add_special_tokens=False))
+            test_dataset = test_dataset.map(lambda x: tokenizer(x['text'], add_special_tokens=False))
         else:
             raise NotImplementedError("")
 
     with accelerator.main_process_first():
         train_dataset = train_dataset.select_columns(['input_ids']).map(lambda x: group_texts(x, segment_size, history_size),
                                                                         batched=True,
-                                                                        batch_size=50_000,
                                                                         # desc=f"Grouping train in chunks of {segment_size} and history {history_size}"
                                                                         )
         valid_dataset = valid_dataset.select_columns(['input_ids']).map(lambda x: group_texts(x, segment_size, val_history_size),
                                                                         batched=True,
-                                                                        batch_size=50_000,
                                                                         # desc=f"Grouping valid in chunks of {segment_size} and history {val_history_size}"
                                                                         )
         test_dataset = test_dataset.select_columns(['input_ids']).map(lambda x: group_texts(x, segment_size, val_history_size),
                                                                       batched=True,
-                                                                        batch_size=50_000,
                                                                       #  desc=f"Grouping test in chunks of {segment_size} and history {val_history_size}"
                                                                       )
 
@@ -288,7 +276,7 @@ if __name__ == '__main__':
         cell = memory_cell_cls(model, num_mem_tokens=args.num_mem_tokens)
         model = recurrent_wrapper_cls(cell,
                                       segment_size=segment_size,
-                                      max_n_segments=int(args.max_n_segments),
+                                      max_n_segments=args.max_n_segments,
                                       vary_n_segments=args.vary_n_segments,
                                       k2=args.k2
                                       )
@@ -305,14 +293,13 @@ if __name__ == '__main__':
     training_args_dict['bf16'] = True
     training_args_dict['label_names'] = ['labels']
 
-    training_args_dict['eval_strategy'] = 'steps'
+    training_args_dict['evaluation_strategy'] = 'steps'
     training_args_dict['per_device_eval_batch_size'] = training_args_dict.get('per_device_train_batch_size') // 4
     training_args_dict['eval_accumulation_steps'] = 32
     training_args_dict['gradient_checkpointing'] = True
     training_args_dict['gradient_checkpointing_kwargs'] = {'use_reentrant': False}
     training_args_dict['log_level'] = 'debug'
     training_args_dict["ignore_data_skip"] = True
-    training_args_dict["warmup_steps"] = 1000
     training_args = TrainingArguments(**training_args_dict)
     # args.gradient_checkpointing = True
 
@@ -327,6 +314,6 @@ if __name__ == '__main__':
     )
     print("Trainer Gradient Checkpointing Enabled:", trainer.args.gradient_checkpointing)
 
-    # trainer.evaluate()
+    trainer.evaluate()
     if not args.validate_only:
         trainer.train(resume_from_checkpoint=args.checkpoint)

@@ -3,48 +3,37 @@ import os
 from pathlib import Path
 from datetime import timedelta
 import torch
-import numpy as np
 import datasets
-from trl import SFTTrainer, SFTConfig
 from transformers import EarlyStoppingCallback, set_seed
-from torch.optim.lr_scheduler import LambdaLR
-from torch.optim import AdamW
-# from lm_experiments_tools.dataset_preprocessing import load_and_preprocess_task, combine_datasets
-# from lm_experiments_tools.instruction_utils import mask_non_completion, mask_non_completion_multi
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from transformers.modeling_utils import PreTrainedModel
 
 from torch.nn.utils.rnn import pad_sequence
 
 import accelerate
 from peft import get_peft_model, LoraConfig, TaskType
 
-# import transformers  # noqa: E402
 from transformers import AutoConfig, AutoTokenizer, HfArgumentParser  # noqa: E402
 
-# from lm_experiments_tools.utils import get_cls_by_name, get_optimizer, prepare_run  # noqa: E402
 from lm_experiments_tools.utils import get_cls_by_name
+
+from utils.reasoning import make_segment, split_cot
+
+from trl import GRPOTrainer, GRPOConfig, DPOTrainer
+
+from modeling_rmt.huggingface import RMTConfig, RMTForReasoning
 
 logger_fmt = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 logging.basicConfig(format=logger_fmt, level=logging.INFO)
 logger = logging.getLogger('')
 
-
-# if CUDA_VISIBLE_DEVICES is not set make all gpus visible
 if os.environ.get('CUDA_VISIBLE_DEVICES', None) is None:
     os.environ['CUDA_VISIBLE_DEVICES'] = ','.join([str(i) for i in range(torch.cuda.device_count())])
 
 logger.info(f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
-# first call to torch.cuda.device_count() sets visible gpus, following calls will not change the result
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
-# limit # of CPU threads to be used per pytorch worker, otherwise it might use all cpus and throttle gpus
-# > 2 fails cause of https://github.com/pytorch/pytorch/issues/56615
-# need to upgrade to torch>1.8.1
-# torch.set_num_threads(4)
-# all gpus set with CUDA_VISIBLE_DEVICES are visible to process, indexing from 0 to ...
-# torch.cuda.set_device(hvd.local_rank())
-
-parser = HfArgumentParser(SFTConfig)
-# parser.add_argument('--task_names', type=str, help="Task names, separated by : , wikitext:arxiv: ...")
+parser = HfArgumentParser(GRPOConfig)
 parser.add_argument('--task_name', type=str, help="Task name, wikitext:arxiv ...")
 parser.add_argument('--dataset_dir', type=str, default=None, help="path to local dataset dir")
 parser.add_argument('--dataset_name', type=str, default=None, help="name of HF dataset")
@@ -114,8 +103,6 @@ parser.add_argument('--memory_layers', type=str, help='memory-augmented layer in
 parser.add_argument('--share_memory_layers', action='store_true', help='share weights of memory layers', default=False)
 parser.add_argument('--reconstruction_loss_coef', type=float, default=None,
                     help='reconstuction loss ratio in total loss')
-# parser.add_argument('--segment_ordering', type=str,help='????', default='regular',
-#                     choices=['regular', 'reversed', 'bidirectional', 'repeat_first', 'last_memory_only'])
 parser.add_argument('--retain_graph', action='store_true', help='Retain computation graph during backward pass',
                     default=False)
 parser.add_argument('--use_truncated_backward', action='store_true', default=False,
@@ -173,14 +160,91 @@ parser.add_argument('--adapter_dropout', type=float, default=0.1, help='')
 parser.add_argument('--adapter_scale', type=float, default=4.0, help='')
 
 
+class RMT_GRPOTrainer(GRPOTrainer):
+    """
+    A custom GRPOTrainer that is adapted to work with the segment-based input
+    required by the RMTForReasoning model. It accepts a custom data collator
+    and overrides the forward pass to handle the 'segments' dictionary.
+    """
+
+    def __init__(
+        self,
+        model: Union[PreTrainedModel, torch.nn.Module] = None,
+        args: Optional[GRPOConfig] = None,
+        data_collator: Optional[Callable] = None,
+        train_dataset: Optional[datasets.Dataset] = None,
+        eval_dataset: Optional[Union[datasets.Dataset, Dict[str, "datasets.Dataset"]]] = None,
+        tokenizer: Optional[Any] = None,
+        **kwargs,
+    ):
+        # We override the init to accept and store a custom data_collator.
+        # The original GRPOTrainer does not accept this argument.
+        # We call the grandparent's init to bypass the DPO's dataset processing.
+        super(DPOTrainer, self).__init__(
+            model=model,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            **kwargs,
+        )
+        # The parent class's `_prepare_dataset` method might have been called.
+        # We ensure `_signature_columns` is None to avoid issues with column removal,
+        # as our collator handles the data structure.
+        self._signature_columns = None
+
+    def get_train_dataloader(self) -> torch.utils.data.DataLoader:
+        """Overrides the default method to use our custom data collator."""
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        return torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.args.train_batch_size,
+            sampler=self._get_train_sampler(),
+            collate_fn=self.data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
+    def get_eval_dataloader(self, eval_dataset: Optional[datasets.Dataset] = None) -> torch.utils.data.DataLoader:
+        """Overrides the default method to use our custom data collator for evaluation."""
+        if eval_dataset is None and self.eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires an eval_dataset.")
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+
+        return torch.utils.data.DataLoader(
+            eval_dataset,
+            batch_size=self.args.eval_batch_size,
+            sampler=self._get_eval_sampler(eval_dataset),
+            collate_fn=self.data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
+    def concatenated_forward(
+        self, model: torch.nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+        """Overrides the DPO forward pass to work with the RMT model's `segments` input."""
+        chosen_outputs = model(segments=batch["chosen_segments"], labels=batch["chosen_labels"])
+        rejected_outputs = model(segments=batch["rejected_segments"], labels=batch["rejected_labels"])
+
+        # The loss is the negative log-likelihood, so we negate it to get the log-probability.
+        chosen_logps = chosen_outputs.loss.detach() * -1
+        rejected_logps = rejected_outputs.loss.detach() * -1
+
+        return chosen_logps, rejected_logps, chosen_outputs.logits, rejected_outputs.logits
+
+
 if __name__ == '__main__':
     args = parser.parse_args()
-    # set current working dir
     args.working_dir = str(Path(args.working_dir).expanduser().absolute())
     os.chdir(args.working_dir)
     set_seed(args.seed)
 
-    # workaround with setting bigger tiomeout for NCCL (useful for big dataset, to avoid timeout at tokenization)
     timeout = timedelta(seconds=20 * 1800)
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps,
                                          kwargs_handlers=[accelerate.InitProcessGroupKwargs(timeout=timeout)])
@@ -202,7 +266,6 @@ if __name__ == '__main__':
         tokenizer.chat_template = it_tokenizer.chat_template
     if args.padding_side is not None:
         tokenizer.padding_side = args.padding_side
-    # Prepare datasets
     logger.info(f'preparing dataset for {args.task_name}')
 
     if args.dataset_name is not None:
@@ -215,7 +278,6 @@ if __name__ == '__main__':
             test_dataset = None
     else:
         dataset_path = os.path.join(args.dataset_dir, args.task_name)
-
         train_dataset = datasets.load_from_disk(os.path.join(dataset_path, "train"))
         valid_dataset = datasets.load_from_disk(os.path.join(dataset_path, "valid"))
         if os.path.exists(os.path.join(dataset_path, "test")):
@@ -228,17 +290,18 @@ if __name__ == '__main__':
         valid_dataset = valid_dataset.filter(lambda x: x['cot_len'] <= args.max_cot_steps)
         test_dataset = test_dataset.filter(lambda x: x['cot_len'] <= args.max_cot_steps)
         logger.info(f"Filtered ds sizes: {len(train_dataset), len(valid_dataset), len(test_dataset)}")
-    if 'gsm8k' in args.task_name:
-        delim = ">> <<"
-    elif 'multiplication' in args.task_name:
-        delim = ' + '
-    else:
-        raise NotImplementedError(f"Unknown task name {args.task_name}")
+
 
     id_pad_value = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    think = tokenizer.encode('????')
-    bos = tokenizer.encode('////')
-    ans = tokenizer.encode('!!!!')
+    if 'gpt2' in args.from_pretrained:
+        think = tokenizer.encode('????')
+        bos = tokenizer.encode('////')
+        ans = tokenizer.encode('!!!!')
+    elif 'SmolLM' in args.from_pretrained:
+        bos = [tokenizer.bos_token_id]
+        think = tokenizer.encode("<issue_start>")
+        ans = tokenizer.encode("<issue_closed>")
+
     eos = [tokenizer.eos_token_id]
     if 'gsm8k' in args.task_name:
         delim = ">> <<"
@@ -248,77 +311,103 @@ if __name__ == '__main__':
         raise NotImplementedError(f"Unknown task name {args.task_name}")
 
     def collate_fn(batch):
-        input_ids, labels, labels_mask, attention_mask = [], [], [], []
+        # This collate_fn now creates preference pairs on the fly.
+        # "chosen" is the ground truth.
+        # "rejected" is a synthetically generated incorrect answer (truncated CoT).
+        chosen_segments_batch = []
+        rejected_segments_batch = []
+
+        def prepare_segments(prompt_tokens, cot_segments, label_tokens):
+            segments = []
+            segments.append(make_segment(bos + prompt_tokens + think, loss=False))
+            if cot_segments:
+                cot_segment_tokens = tokenizer.batch_encode_plus(cot_segments, add_special_tokens=False)['input_ids']
+                for segment in cot_segment_tokens[:-1]:
+                    segments.append(make_segment(bos + segment + think, loss=True))
+                segments.append(make_segment(bos + cot_segment_tokens[-1] + ans, loss=True))
+            segments.append(make_segment(bos + label_tokens + eos, loss=True))
+            return segments
+
         for sample in batch:
             task, lab, cot = sample['task'], sample['labels'], sample['cot']
             task_tokens = tokenizer.encode(task, add_special_tokens=False)
-            labels_tokens = tokenizer.encode(lab, add_special_tokens=False)
-            cot_tokens = tokenizer.encode(cot, add_special_tokens=False)
+            chosen_label_tokens = tokenizer.encode(lab, add_special_tokens=False)
+            chosen_cot_segments = split_cot(cot, by=delim) if getattr(args, 'use_cot', False) else [cot]
+            chosen_segments = prepare_segments(task_tokens, chosen_cot_segments, chosen_label_tokens)
+            chosen_segments_batch.append(chosen_segments)
 
-            if args.use_cot:
-                full_input = task_tokens + think + cot_tokens + ans + labels_tokens + eos
-            else:
-                full_input = task_tokens + ans + labels_tokens + eos
-            inp_ids = torch.tensor(full_input)
-            input_ids.append(inp_ids)
+            # Create a synthetic rejected sample by truncating the CoT
+            if len(chosen_cot_segments) > 1:
+                rejected_cot_segments = chosen_cot_segments[:-1]
+                rejected_label_tokens = tokenizer.encode("wrong answer", add_special_tokens=False)
+            else: # if no CoT, just provide a bad answer
+                rejected_cot_segments = []
+                rejected_label_tokens = tokenizer.encode("I don't know", add_special_tokens=False)
+            rejected_segments = prepare_segments(task_tokens, rejected_cot_segments, rejected_label_tokens)
+            rejected_segments_batch.append(rejected_segments)
 
-            lab = torch.tensor(full_input)
-            lab[:len(task_tokens)] = -100
-            labels.append(lab)
+        def pad_and_collate(segments_batch):
+            num_segments = max(len(s) for s in segments_batch)
+            for segments in segments_batch:
+                if len(segments) < num_segments:
+                    segments.extend([make_segment(eos, loss=False)] * (num_segments - len(segments)))
 
-            lab_mask = torch.ones_like(inp_ids)
-            lab_mask[:len(task_tokens)] = 0
-            labels_mask.append(lab_mask)
-            attention_mask.append(torch.ones_like(inp_ids))
+            batch_segments = []
+            for i in range(num_segments):
+                input_ids = pad_sequence([s[i]['input_ids'] for s in segments_batch], batch_first=True, padding_value=id_pad_value)
+                attention_mask = pad_sequence([s[i]['attention_mask'] for s in segments_batch], batch_first=True, padding_value=0)
+                labels = pad_sequence([s[i]['labels'] for s in segments_batch], batch_first=True, padding_value=-100)
+                batch_segments.append({'input_ids': input_ids, 'attention_mask': attention_mask, 'labels': labels})
+            
+            full_labels = torch.cat([s['labels'] for s in batch_segments], dim=1)
+            return batch_segments, full_labels
 
-        input_ids = pad_sequence(input_ids, padding_value=id_pad_value, batch_first=True)
-        attention_mask = pad_sequence(attention_mask, padding_value=0, batch_first=True)
-        labels = pad_sequence(labels, padding_value=id_pad_value, batch_first=True)
-        labels_mask = pad_sequence(labels_mask, padding_value=0, batch_first=True)
+        chosen_segs, chosen_labs = pad_and_collate(chosen_segments_batch)
+        rejected_segs, rejected_labs = pad_and_collate(rejected_segments_batch)
 
-        collated = {'input_ids': input_ids,
-                    'labels': labels,
-                    'attention_mask': attention_mask,
-                    }
-        return collated
+        return {
+            "chosen_segments": chosen_segs,
+            "chosen_labels": chosen_labs,
+            "rejected_segments": rejected_segs,
+            "rejected_labels": rejected_labs,
+        }
+
 
     # define model
     # TODO: move model building to separate function
     model_cls = get_cls_by_name(args.model_cls)
     logger.info(f'Using model class: {model_cls}')
 
-    if args.use_adapter:
-        model_cfg = AutoConfig.from_pretrained(args.from_pretrained)
+    # if args.use_adapter:
+    #     raise NotImplementedError('Adapter is not supported for RMT-v4')
+    #     model_cfg = AutoConfig.from_pretrained(args.from_pretrained)
+    #     model_cfg.use_parallel_adapter = args.use_adapter
+    #     model_cfg.parallel_adapter_mode = 'ffn'
+    #     model_cfg.adapter_bottleneck_dim = args.adapter_bottleneck_dim
+    #     model_cfg.adapter_dropout = args.adapter_dropout
+    #     model_cfg.adapter_scale = args.adapter_scale
+    #     model = model_cls(config=model_cfg)
+    #     logger.info(f'Loading pretrained model: {args.from_pretrained}')
+    #     base_model = model_cls.from_pretrained(args.from_pretrained, use_safetensors=False)
+    #     model.load_state_dict(base_model.state_dict(), strict=False)
+    #     del base_model
+    #     logger.info('Added adapters')
+    # else:
+    #     if args.from_pretrained is None and args.model_cfg is not None:
+    #         model_cfg = AutoConfig.from_pretrained(args.model_cfg)
+    #         model = model_cls.from_config(model_cfg)
+    #     elif args.from_pretrained is not None:
+    #         logger.info(f'Loading pretrained model: {args.from_pretrained}')
+    #         if "Qwen" in args.from_pretrained or "Llama" in args.from_pretrained:
+    #             model = model_cls.from_pretrained(args.from_pretrained,
+    #                                               attn_implementation="flash_attention_2",
+    #                                               trust_remote_code=True)
+    #         else:
+    #             model = model_cls.from_pretrained(args.from_pretrained)
 
-        model_cfg.use_parallel_adapter = args.use_adapter
-        model_cfg.parallel_adapter_mode = 'ffn'
-        model_cfg.adapter_bottleneck_dim = args.adapter_bottleneck_dim
-        model_cfg.adapter_dropout = args.adapter_dropout
-        model_cfg.adapter_scale = args.adapter_scale
-
-        model = model_cls(config=model_cfg)
-
-        logger.info(f'Loading pretrained model: {args.from_pretrained}')
-        base_model = model_cls.from_pretrained(args.from_pretrained)#, use_safetensors=False)
-
-        model.load_state_dict(base_model.state_dict(), strict=False)
-        del base_model
-        logger.info('Added adapters')
-    else:
-        # TODO: fix if for Qwen and Llama
-        if not args.from_pretrained:
-            model_cfg = AutoConfig.from_pretrained(args.model_cfg)
-            model = model_cls.from_config(model_cfg)
-        else:
-            logger.info(f'Loading pretrained model: {args.from_pretrained}')
-            if "Qwen" in args.from_pretrained or "Llama" in args.from_pretrained:
-                model = model_cls.from_pretrained(args.from_pretrained,
-                                                  attn_implementation="flash_attention_2",
-                                                  torch_dtype=torch.bfloat16,
-                                                  trust_remote_code=True)
-            else:
-                model = model_cls.from_pretrained(args.from_pretrained)#, use_safetensors=False)
+    # add LoRA adapters
     if args.use_lora:
+        raise NotImplementedError('LoRA is not supported for RMT-v4')
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -331,38 +420,32 @@ if __name__ == '__main__':
         model.print_trainable_parameters()
     # load cpt of backbone model
     if args.backbone_cpt:
-        backbone_cpt = os.path.join(args.backbone_cpt, "model_best.pth")
+        raise NotImplementedError('Backbone cpt is not supported for RMT-v4')
+        if 'bin' in args.backbone_cpt:
+            backbone_cpt = args.backbone_cpt
+        else:
+            backbone_cpt = os.path.join(args.backbone_cpt, "model_best.pth")
         cpt = torch.load(backbone_cpt, map_location='cpu')
-        model.load_state_dict(cpt['model_state_dict'], strict=False)
+        model.load_state_dict(cpt['model_state_dict'], strict=True)
         logger.info(f'Loaded baseline state dict from: {args.backbone_cpt}')
-    # Pass memory settings to pretrained model
     if args.num_mem_tokens is not None:
-        memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
-        recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
-        logger.info(f'Wrapping in: {memory_cell_cls} and {recurrent_wrapper_cls}')
-        mem_cell_args = dict(
-            base_model=model,
-            num_mem_tokens=args.num_mem_tokens,
-        )
-        # additional parameters for ARMT model
-        if args.d_mem is not None:
-            mem_cell_args['d_mem'] = args.d_mem
-            mem_cell_args['wrap_pos'] = args.wrap_pos
-            mem_cell_args['correction'] = not args.no_correction
-            # mem_cell_args['use_lora'] = args.use_lora
-        if args.layers_attr is not None:
-            mem_cell_args['layers_attr'] = args.layers_attr
-        if args.attend_to_previous_input:
-            mem_cell_args['attend_to_previous_input'] = args.attend_to_previous_input
-        cell = memory_cell_cls(**mem_cell_args)
-        model = recurrent_wrapper_cls(cell,
-                                      segment_size=args.segment_size,
-                                      max_n_segments=args.max_n_segments,
-                                      vary_n_segments=args.vary_n_segments,
-                                      k2=args.k2,
-                                      attend_to_previous_input=args.attend_to_previous_input,
-                                      return_all_logits=False,
-                                      )
+        config = RMTConfig(num_mem_tokens=args.num_mem_tokens, 
+                           max_n_segments=10,
+                           think_token_id=think[0],
+                           answer_token_id=ans[0],
+                           bos_token_id=bos[0],
+                           eos_token_id=eos[0],
+                           d_mem=args.d_mem,
+                           wrap_pos=args.wrap_pos,
+                           correction=not args.no_correction,
+                           layers_attr=args.layers_attr,
+                           attend_to_previous_input=args.attend_to_previous_input,
+                           segment_size=args.segment_size,
+                           k2=args.k2,
+                           return_all_logits=False,
+                           answer_loss_weight=args.answer_loss_weight
+                           )
+        model = RMTForReasoning(config)
         # load cpt of rmt
         if args.model_cpt:
             if "safetensors" in args.model_cpt:
@@ -381,8 +464,7 @@ if __name__ == '__main__':
                 cpt = torch.load(model_cpt, map_location='cpu')
                 model.load_state_dict(cpt, strict=False)
             logger.info(f'Loaded RMT state dict from: {args.model_cpt}')
-            logger.info('Trainable parameters after adding RMT/ARMT:')
-            logger.info(f'Remaining parameters: {[n for n, p in model.named_parameters() if p.requires_grad]}')
+            logger.info(f'Trainable parameters after adding RMT/ARMT: {[n for n, p in model.named_parameters() if p.requires_grad]}')
     if args.add_lora_to_armt:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -395,7 +477,6 @@ if __name__ == '__main__':
         model.memory_cell.model = get_peft_model(model.memory_cell.model, peft_config)
         logger.info('Added LoRA, trainable parameters with LoRA only:')
         model.memory_cell.model.print_trainable_parameters()
-        # print(model)
     if args.freeze_model_weights:
         for n, p in model.named_parameters():
             if 'memory' not in n and 'lora' not in n and 'adapter' not in n:
@@ -428,17 +509,18 @@ if __name__ == '__main__':
             for param in module.parameters():
                 param.set_(param.contiguous())
     make_contiguous(model)
-    # now switch to HF trainer
-    training_args_dict = {key: value for key, value in vars(args).items() if hasattr(SFTConfig('.'), key)}
+    training_args_dict = {key: value for key, value in vars(args).items() if hasattr(GRPOConfig('.'), key)}
 
     training_args_dict['remove_unused_columns'] = False
     training_args_dict['save_safetensors'] = False
     training_args_dict['bf16'] = True
     training_args_dict['label_names'] = ['labels']
-    training_args_dict['evaluation_strategy'] = 'steps'
-    eval_batch_size = training_args_dict.get('per_device_train_batch_size') // 16
-    training_args_dict['per_device_eval_batch_size'] = max(eval_batch_size, 1)
-    training_args_dict['eval_accumulation_steps'] = 16
+    training_args_dict['eval_strategy'] = 'steps'
+    if training_args_dict.get('per_device_train_batch_size') == 1:
+        training_args_dict['per_device_eval_batch_size'] = training_args_dict.get('per_device_train_batch_size')
+    else:
+        training_args_dict['per_device_eval_batch_size'] = training_args_dict.get('per_device_train_batch_size') // 2
+    training_args_dict['eval_accumulation_steps'] = 32
     if args.d_mem is None:
         # for now, gradient checkpointing doesn't supported for ARMT
         training_args_dict['gradient_checkpointing'] = True
@@ -446,72 +528,33 @@ if __name__ == '__main__':
     training_args_dict['log_level'] = 'debug'
     training_args_dict['load_best_model_at_end'] = args.early_stopping_patience != -1
 
-    training_args_dict['dataset_kwargs'] = {"skip_prepare_dataset": True}
+    # training_args_dict['dataset_kwargs'] = {"skip_prepare_dataset": True}
 
-    if args.num_mem_tokens is not None:
-        # fix max_seq_length warning
-        training_args_dict["max_seq_length"] = args.sample_size
-        model.to(torch.bfloat16)
-    training_args = SFTConfig(**training_args_dict)
+    # if args.num_mem_tokens is not None:
+    #     # fix max_seq_length warning
+    #     training_args_dict["max_seq_length"] = args.segment_size
 
-    def compute_accuracy(eval_pred):
-        preds = eval_pred.predictions.argmax(axis=-1)[:, :-1]
-        labels = eval_pred.label_ids[:, 1:]
+    training_args = GRPOConfig(**training_args_dict)
 
-        labels_masks = labels > 0
-        preds_full = [p[m] for p, m in zip(preds, labels_masks)]
-        labels_full = [lab[m] for lab, m in zip(labels, labels_masks)]
+    # The GRPOTrainer handles its own optimizer and scheduler creation.
+    # The SFT-style compute_metrics and reward functions are not directly used
+    # in the preference-based training loop.
 
-        special_tokens = {ans[0], bos[0]}
-        acc_cot, acc_ans = [], []
-        for lab_tokens, pred_tokens in zip(labels_full, preds_full):
-            ans_start_index = max(i for i, x in enumerate(lab_tokens) if x == ans[0])
-
-            pred_cot_tokens = pred_tokens[:ans_start_index].tolist()
-            lab_cot_tokens = lab_tokens[:ans_start_index].tolist()
-
-            cot_correct = [p == l for p, l in zip(pred_cot_tokens, lab_cot_tokens) if l not in special_tokens]
-            acc_cot.append(all(cot_correct))
-
-            pred_ans_tokens = pred_tokens[ans_start_index:].tolist()
-            lab_ans_tokens = lab_tokens[ans_start_index:].tolist()
-
-            ans_correct = [p == l for p, l in zip(pred_ans_tokens, lab_ans_tokens) if l not in special_tokens]
-            acc_ans.append(all(ans_correct))
-
-        return {'accuracy_cot': np.mean(acc_cot), 'accuracy_ans': np.mean(acc_ans)}
-
-    def lr_lambda(current_step):
-        if current_step < training_args.warmup_steps:
-            return current_step / training_args.warmup_steps
-        if args.lr_scheduler_type == "linear":
-            decay_factor = (training_args.max_steps - current_step) / (training_args.max_steps - training_args.warmup_steps)
-            return max(args.min_lr / training_args.learning_rate, decay_factor)
-        elif args.lr_scheduler_type == "constant":
-            return 1.0
-        else:
-            raise ValueError("Unsupported lr_scheduler_type")
-
-    optimizer = AdamW(model.parameters(), lr=training_args.learning_rate)
-    scheduler = LambdaLR(optimizer, lr_lambda)
-
-    trainer = SFTTrainer(
+    trainer = RMT_GRPOTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
         tokenizer=tokenizer,
         data_collator=collate_fn,
-        compute_metrics=compute_accuracy,
-        optimizers=(optimizer, scheduler)
     )
-    logger.info(f"Trainer Gradient Checkpointing Enabled: {trainer.args.gradient_checkpointing}")
+    logger.info(f"Trainer Gradient Checkpointing Enabled: {getattr(trainer.args, 'gradient_checkpointing', False)}")
     if args.early_stopping_patience != -1:
         early_stopping = EarlyStoppingCallback(
             early_stopping_patience=args.early_stopping_patience
         )
         trainer.add_callback(early_stopping)
-    start_metrics = trainer.evaluate()
-    logger.info(f"Metrics of initial model: {start_metrics}")
+    # start_metrics = trainer.evaluate()
+    # logger.info(f"Metrics of initial model: {start_metrics}")
     if not args.validate_only:
         trainer.train(resume_from_checkpoint=args.checkpoint)

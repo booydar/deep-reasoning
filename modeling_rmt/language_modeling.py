@@ -201,6 +201,6 @@ class RecurrentWrapper(torch.nn.Module):
 
         memory_state = memory_state.detach()
         return memory_state
-    
+
     def gradient_checkpointing_enable(self, *args, **kwargs):
         self.memory_cell.model.gradient_checkpointing_enable(*args, **kwargs)

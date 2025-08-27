@@ -5,8 +5,10 @@ import os
 import torch
 import numpy as np
 import datasets
+from trl import SFTTrainer, SFTConfig
+from transformers import EarlyStoppingCallback
 
-from transformers import Trainer, TrainingArguments
+# from transformers import Trainer, TrainingArguments
 from torch.nn.utils.rnn import pad_sequence
 
 import accelerate
@@ -25,7 +27,7 @@ logger.info(f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
 # first call to torch.cuda.device_count() sets visible gpus, following calls will not change the result
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
-parser = HfArgumentParser(TrainingArguments)
+parser = HfArgumentParser(SFTConfig)
 parser.add_argument('--task_name', type=str, help="Task name, wikitext, ...")
 parser.add_argument('--tokenized_dataset', type=str, help="path to folder with tokenized hf dataset")
 parser.add_argument('--validate_only', action='store_true', default=False,
@@ -99,6 +101,8 @@ parser.add_argument('--relative_step', action='store_true', default=False,
                     help='Adafactor relative_step (default: False)')
 parser.add_argument('--warmup_init', action='store_true', default=False,
                     help='Adafactor warmup_init (default: False)')
+parser.add_argument('--early_stopping_patience', type=int, default=-1,
+                    help='Early stopping tolerance')
 
 # LoRA args
 parser.add_argument('--use_lora', action='store_true', default=False, help='')
@@ -211,35 +215,23 @@ if __name__ == '__main__':
                 train_dataset = dataset['train']
                 valid_dataset = dataset["validation"]
                 test_dataset = dataset["test"]
-            train_dataset = train_dataset.map(lambda x: tokenizer(x['text'],
-                                              add_special_tokens=False),
-                                              batched=True,
-                                              batch_size=50_000,)
-            valid_dataset = valid_dataset.map(lambda x: tokenizer(x['text'],
-                                              add_special_tokens=False),
-                                              batched=True,
-                                              batch_size=50_000,)
-            test_dataset = test_dataset.map(lambda x: tokenizer(x['text'],
-                                            add_special_tokens=False),
-                                            batched=True,
-                                            batch_size=50_000,)
+            train_dataset = train_dataset.map(lambda x: tokenizer(x['text'], add_special_tokens=False))
+            valid_dataset = valid_dataset.map(lambda x: tokenizer(x['text'], add_special_tokens=False))
+            test_dataset = test_dataset.map(lambda x: tokenizer(x['text'], add_special_tokens=False))
         else:
             raise NotImplementedError("")
 
     with accelerator.main_process_first():
         train_dataset = train_dataset.select_columns(['input_ids']).map(lambda x: group_texts(x, segment_size, history_size),
                                                                         batched=True,
-                                                                        batch_size=50_000,
                                                                         # desc=f"Grouping train in chunks of {segment_size} and history {history_size}"
                                                                         )
         valid_dataset = valid_dataset.select_columns(['input_ids']).map(lambda x: group_texts(x, segment_size, val_history_size),
                                                                         batched=True,
-                                                                        batch_size=50_000,
                                                                         # desc=f"Grouping valid in chunks of {segment_size} and history {val_history_size}"
                                                                         )
         test_dataset = test_dataset.select_columns(['input_ids']).map(lambda x: group_texts(x, segment_size, val_history_size),
                                                                       batched=True,
-                                                                        batch_size=50_000,
                                                                       #  desc=f"Grouping test in chunks of {segment_size} and history {val_history_size}"
                                                                       )
 
@@ -288,7 +280,7 @@ if __name__ == '__main__':
         cell = memory_cell_cls(model, num_mem_tokens=args.num_mem_tokens)
         model = recurrent_wrapper_cls(cell,
                                       segment_size=segment_size,
-                                      max_n_segments=int(args.max_n_segments),
+                                      max_n_segments=args.max_n_segments,
                                       vary_n_segments=args.vary_n_segments,
                                       k2=args.k2
                                       )
@@ -299,34 +291,39 @@ if __name__ == '__main__':
             model.load_state_dict(cpt, strict=False)
             logger.info(f'Loaded RMT state dict from: {args.model_cpt}')
 
-    training_args_dict = {key: value for key, value in vars(args).items() if hasattr(TrainingArguments('.'), key)}
+    training_args_dict = {key: value for key, value in vars(args).items() if hasattr(SFTConfig('.'), key)}
     training_args_dict['remove_unused_columns'] = False
     training_args_dict['save_safetensors'] = False
     training_args_dict['bf16'] = True
     training_args_dict['label_names'] = ['labels']
 
-    training_args_dict['eval_strategy'] = 'steps'
+    training_args_dict['evaluation_strategy'] = 'steps'
     training_args_dict['per_device_eval_batch_size'] = training_args_dict.get('per_device_train_batch_size') // 4
     training_args_dict['eval_accumulation_steps'] = 32
     training_args_dict['gradient_checkpointing'] = True
     training_args_dict['gradient_checkpointing_kwargs'] = {'use_reentrant': False}
     training_args_dict['log_level'] = 'debug'
     training_args_dict["ignore_data_skip"] = True
-    training_args_dict["warmup_steps"] = 1000
-    training_args = TrainingArguments(**training_args_dict)
+    training_args = SFTConfig(**training_args_dict)
     # args.gradient_checkpointing = True
 
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
+        tokenizer=tokenizer,
         # test_dataset=test_dataset,
         # compute_metrics=compute_metrics,
         data_collator=collate_fn,
     )
-    print("Trainer Gradient Checkpointing Enabled:", trainer.args.gradient_checkpointing)
-
-    # trainer.evaluate()
+    logger.info(f"Trainer Gradient Checkpointing Enabled: {trainer.args.gradient_checkpointing}")
+    if args.early_stopping_patience != -1:
+        early_stopping = EarlyStoppingCallback(
+            early_stopping_patience=args.early_stopping_patience
+        )
+        trainer.add_callback(early_stopping)
+    start_metrics = trainer.evaluate()
+    logger.info(f"Metrics of initial model: {start_metrics}")
     if not args.validate_only:
         trainer.train(resume_from_checkpoint=args.checkpoint)

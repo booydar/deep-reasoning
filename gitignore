@@ -1,0 +1,5 @@
+# *test*
+*.pyc
+.gitignore
+*__pycache__*
+data/*
