@@ -288,7 +288,7 @@ if __name__ == '__main__':
         cell = memory_cell_cls(model, num_mem_tokens=args.num_mem_tokens)
         model = recurrent_wrapper_cls(cell,
                                       segment_size=segment_size,
-                                      max_n_segments=int(args.max_n_segments),
+                                      max_n_segments=args.max_n_segments,
                                       vary_n_segments=args.vary_n_segments,
                                       k2=args.k2
                                       )
@@ -305,7 +305,7 @@ if __name__ == '__main__':
     training_args_dict['bf16'] = True
     training_args_dict['label_names'] = ['labels']
 
-    training_args_dict['eval_strategy'] = 'steps'
+    training_args_dict['evaluation_strategy'] = 'steps'
     training_args_dict['per_device_eval_batch_size'] = training_args_dict.get('per_device_train_batch_size') // 4
     training_args_dict['eval_accumulation_steps'] = 32
     training_args_dict['gradient_checkpointing'] = True
@@ -327,6 +327,6 @@ if __name__ == '__main__':
     )
     print("Trainer Gradient Checkpointing Enabled:", trainer.args.gradient_checkpointing)
 
-    # trainer.evaluate()
+    trainer.evaluate()
     if not args.validate_only:
         trainer.train(resume_from_checkpoint=args.checkpoint)

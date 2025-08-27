@@ -1,5 +1,5 @@
 # *test*
 *.pyc
 .gitignore
-*-dev.*
 *__pycache__*
+data/*
