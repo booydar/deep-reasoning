@@ -122,8 +122,10 @@ if __name__ == '__main__':
 
     if args.tokenizer:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    else:
+    elif args.from_pretrained:
         tokenizer = AutoTokenizer.from_pretrained(args.from_pretrained)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_cfg)
 
     # Prepare datasets
     logger.info(f'preparing dataset for {args.task_name}')
@@ -197,38 +199,32 @@ if __name__ == '__main__':
             dataset = datasets.load_from_disk(args.tokenized_dataset)
         elif args.task_name is not None:
             if 'fineweb' in args.task_name:
-                train_dataset = datasets.load_dataset("HuggingFaceFW/fineweb-edu", 
+                dataset = datasets.load_dataset("HuggingFaceFW/fineweb-edu", 
                                                     #   name="CC-MAIN-2024-10",
                                                       data_dir="sample/10BT",
-                                                      split="train", 
+                                                    #   split="train", 
                                                     #   streaming=True
                                                       )
-                other_dataset = datasets.load_dataset('Salesforce/wikitext', 'wikitext-103-raw-v1')
-                valid_dataset = other_dataset["validation"]
-                test_dataset = other_dataset["test"]
+                valid_dataset = dataset["train"].select(range(100))
+                test_dataset = dataset["train"].select(range(100, 1100))
+                train_dataset = dataset["train"].select(range(1100, 10_000))
+                # train_dataset = dataset["train"].select(range(1100, len(dataset["train"])))
             else:
-                if 'wikitext' in args.task_name:
-                    dataset = datasets.load_dataset('Salesforce/wikitext', 'wikitext-103-raw-v1')
-                else:
-                    dataset = datasets.load_dataset(args.task_name)
-
-                train_dataset = dataset['train']
-                valid_dataset = dataset["validation"]
-                test_dataset = dataset["test"]
+                raise NotImplementedError("")
             train_dataset = train_dataset.map(lambda x: tokenizer(x['text'],
                                               add_special_tokens=False),
                                               batched=True,
-                                              batch_size=500,
+                                            #   batch_size=500,
                                               )
             valid_dataset = valid_dataset.map(lambda x: tokenizer(x['text'],
                                               add_special_tokens=False),
                                               batched=True,
-                                              batch_size=500,
+                                            #   batch_size=500,
                                               )
             test_dataset = test_dataset.map(lambda x: tokenizer(x['text'],
                                             add_special_tokens=False),
                                             batched=True,
-                                            batch_size=500,
+                                            #   batch_size=500,
                                             )
         else:
             raise NotImplementedError("")
@@ -236,17 +232,17 @@ if __name__ == '__main__':
     with accelerator.main_process_first():
         train_dataset = train_dataset.select_columns(['input_ids']).map(lambda x: group_texts(x, segment_size, history_size),
                                                                         batched=True,
-                                                                        batch_size=100_000 * 128 // segment_size,
+                                                                        # batch_size=100_000 * 128 // segment_size,
                                                                         # desc=f"Grouping train in chunks of {segment_size} and history {history_size}"
                                                                         )
         valid_dataset = valid_dataset.select_columns(['input_ids']).map(lambda x: group_texts(x, segment_size, val_history_size),
                                                                         batched=True,
-                                                                        batch_size=100_000 * 128 // segment_size,
+                                                                        # batch_size=100_000 * 128 // segment_size,
                                                                         # desc=f"Grouping valid in chunks of {segment_size} and history {val_history_size}"
                                                                         )
         test_dataset = test_dataset.select_columns(['input_ids']).map(lambda x: group_texts(x, segment_size, val_history_size),
                                                                       batched=True,
-                                                                        batch_size=100_000 * 128 // segment_size,
+                                                                        # batch_size=100_000 * 128 // segment_size,
                                                                       #  desc=f"Grouping test in chunks of {segment_size} and history {val_history_size}"
                                                                       )
 
@@ -264,6 +260,7 @@ if __name__ == '__main__':
     if not args.from_pretrained:
         model_cfg = AutoConfig.from_pretrained(args.model_cfg)
         model = model_cls.from_config(config=model_cfg)
+        logger.info(f'Loaded model config: {args.model_cfg}')
     else:
         logger.info(f'Loading pretrained model: {args.from_pretrained}')
         model = model_cls.from_pretrained(args.from_pretrained)
@@ -305,6 +302,8 @@ if __name__ == '__main__':
             cpt = torch.load(args.model_cpt, map_location='cpu')
             model.load_state_dict(cpt, strict=False)
             logger.info(f'Loaded RMT state dict from: {args.model_cpt}')
+    else:
+        logger.info(f'Training the base model without RMT')
 
     training_args_dict = {key: value for key, value in vars(args).items() if hasattr(TrainingArguments('.'), key)}
     training_args_dict['remove_unused_columns'] = False

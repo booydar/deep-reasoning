@@ -25,14 +25,14 @@ TASK_DATASET=HuggingFaceFW/fineweb-edu
 
 ITERS=5000
 TBS=1024
-BS=32
+BS=512
 
 LR=3e-04
-SEGMENT_SIZE=64 
+SEGMENT_SIZE=2
 MEMORY_SIZE=32
 
 # First iteration
-MAX_N_SEGMENTS=1
+MAX_N_SEGMENTS=2
 SAMPLE_SIZE=$((MAX_N_SEGMENTS*SEGMENT_SIZE)) # length of task sample in tokens
 GRAD_ACC_STEPS=$(($TBS/($BS*$NP)))
 SCHEDULER=constant
@@ -80,7 +80,7 @@ accelerate launch --num_processes $NP --config_file $ACCEL_CONFIG --main_process
 
 
 # Curriculum
-for MAX_N_SEGMENTS in 2 4 8 16
+for MAX_N_SEGMENTS in 4 8 16
 do
 
         CPT_MAX_N_SEGMENTS=$((MAX_N_SEGMENTS/2))
