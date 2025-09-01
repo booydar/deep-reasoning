@@ -202,8 +202,9 @@ if __name__ == '__main__':
                 dataset = datasets.load_dataset("HuggingFaceFW/fineweb-edu", 
                                                     #   name="CC-MAIN-2024-10",
                                                       data_dir="sample/10BT",
+                                                      cache_dir="/workspace-SR006.nfs2/bulatov/.cache/huggingface/datasets/HuggingFaceFW___fineweb-edu/default-faeb9770c8ce8992",
                                                     #   split="train", 
-                                                    #   streaming=True
+                                                      streaming=False
                                                       )
                 valid_dataset = dataset["train"].select(range(100))
                 test_dataset = dataset["train"].select(range(100, 1100))
