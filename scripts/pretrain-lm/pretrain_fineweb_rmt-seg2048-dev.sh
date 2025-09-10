@@ -5,6 +5,9 @@ set -e
 SCRIPT_DIR=/workspace-SR006.nfs2/bulatov/rmt/reasoning/deep-reasoning
 RUNS_DIR=/workspace-SR006.nfs2/bulatov/rmt/runs
 
+eval "$(conda shell.bash hook)"
+conda activate /workspace-SR006.nfs2/bulatov/envs/env_main/
+
 # SCRIPT_DIR=/home/jovyan/bulatov/rmt/reasoning/deep-reasoning
 # RUNS_DIR=/home/jovyan/bulatov/rmt/runs
 
@@ -37,7 +40,7 @@ SCHEDULER=constant
 
 TBS=2048
 echo TBS $TBS
-BS=1
+BS=64
 GRAD_ACC_STEPS=$(($TBS/($BS*$NP)))
 
 # 15 000 000 000 tokens total
@@ -59,6 +62,8 @@ echo RUNNING: DATASET_NAME $DATASET_NAME MEMORY_SIZE $MEMORY_SIZE SEGMENT_SIZE $
 echo SAMPLE_SIZE $SAMPLE_SIZE MODEL_NAME $MODEL_NAME  LR $LR N $N
 echo gradient accumulation steps $GRAD_ACC_STEPS
 
+# python -m pip install deepspeed
+
 accelerate launch --num_processes $NP --config_file $ACCEL_CONFIG --main_process_port 29033 $MAIN_SCRIPT \
         --task_name $TASK_DATASET \
         --output_dir ${RUNS_DIR}/${DATASET_NAME}/$MODEL_NAME/LR${LR}_${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_bs${TBS}_bptt-${K2}-nfs/run_$N \
@@ -72,7 +77,6 @@ accelerate launch --num_processes $NP --config_file $ACCEL_CONFIG --main_process
         --val_sample_size $SAMPLE_SIZE \
         --num_mem_tokens $MEMORY_SIZE \
         --max_n_segments $MAX_N_SEGMENTS\
-        --no_loss_from_first_segment \
         --per_device_train_batch_size $BS --gradient_accumulation_steps $(($TBS/($BS*$NP))) \
         --max_steps $ITERS \
         --metric_for_best_model "eval_loss" \

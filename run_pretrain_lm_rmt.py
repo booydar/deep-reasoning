@@ -184,16 +184,6 @@ if __name__ == '__main__':
 
         return collated
 
-    # def filter_by_len(sample, min_len=16000):
-    #     return len(sample['tokens']) > min_len
-
-    # def filter_by_16k(sample):
-    #     return len(sample['tokens']) > 16000
-
-    # if args.min_sample_len not in {16000, None}:
-    #     train_dataset = dataset['train'].filter(lambda sample: filter_by_len(sample, args.min_sample_len))
-    # else:
-    #     train_dataset = dataset['train'].filter(filter_by_16k)
     with accelerator.main_process_first():
         if args.tokenized_dataset is not None:
             dataset = datasets.load_from_disk(args.tokenized_dataset)
@@ -201,31 +191,33 @@ if __name__ == '__main__':
             if 'fineweb' in args.task_name:
                 dataset = datasets.load_dataset("HuggingFaceFW/fineweb-edu", 
                                                     #   name="CC-MAIN-2024-10",
-                                                      data_dir="sample/10BT",
+                                                      name="sample-10BT",
                                                       cache_dir="/workspace-SR006.nfs2/bulatov/.cache/huggingface/datasets/HuggingFaceFW___fineweb-edu/default-faeb9770c8ce8992",
-                                                    #   split="train", 
                                                       streaming=False
                                                       )
                 valid_dataset = dataset["train"].select(range(100))
                 test_dataset = dataset["train"].select(range(100, 1100))
-                train_dataset = dataset["train"].select(range(1100, 10_000))
-                # train_dataset = dataset["train"].select(range(1100, len(dataset["train"])))
+                # train_dataset = dataset["train"].select(range(1100, 10_000))
+                train_dataset = dataset["train"].select(range(1100, len(dataset["train"])))
             else:
                 raise NotImplementedError("")
             train_dataset = train_dataset.map(lambda x: tokenizer(x['text'],
                                               add_special_tokens=False),
                                               batched=True,
-                                            #   batch_size=500,
+                                              batch_size=10_000,
+                                              num_proc=16,
                                               )
             valid_dataset = valid_dataset.map(lambda x: tokenizer(x['text'],
                                               add_special_tokens=False),
                                               batched=True,
-                                            #   batch_size=500,
+                                              batch_size=10_000,
+                                              num_proc=16,
                                               )
             test_dataset = test_dataset.map(lambda x: tokenizer(x['text'],
                                             add_special_tokens=False),
                                             batched=True,
-                                            #   batch_size=500,
+                                            batch_size=10_000,
+                                            num_proc=16,
                                             )
         else:
             raise NotImplementedError("")

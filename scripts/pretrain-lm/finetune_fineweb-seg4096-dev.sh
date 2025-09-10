@@ -22,15 +22,14 @@ DATASET_NAME=pretrain-fineweb-edu
 METRIC=exact_match
 
 MODEL_NAME=SmolLM2-360M
-# FROM_PRETRAINED=HuggingFaceTB/SmolLM2-135M
-MODEL_CFG=HuggingFaceTB/SmolLM2-360M
+FROM_PRETRAINED=HuggingFaceTB/SmolLM2-360M
 
 TASK_DATASET=HuggingFaceFW/fineweb-edu
 
 
 
 LR=3e-04
-SEGMENT_SIZE=1024
+SEGMENT_SIZE=4096
 
 # First iteration
 MAX_N_SEGMENTS=1
@@ -39,7 +38,7 @@ SCHEDULER=constant
 
 TBS=2048
 echo TBS $TBS
-BS=64
+BS=16
 GRAD_ACC_STEPS=$(($TBS/($BS*$NP)))
 # GRAD_ACC_STEPS=2
 
@@ -63,8 +62,8 @@ echo gradient accumulation steps $GRAD_ACC_STEPS
 
 accelerate launch --num_processes $NP --config_file $ACCEL_CONFIG --main_process_port 29030 $MAIN_SCRIPT \
         --task_name $TASK_DATASET \
-        --output_dir ${RUNS_DIR}/${DATASET_NAME}/$MODEL_NAME/LR${LR}_${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_bs${TBS}_bptt-${K2}-nfs/run_$N \
-        --model_cfg $MODEL_CFG \
+        --output_dir ${RUNS_DIR}/${DATASET_NAME}/$MODEL_NAME/LR${LR}_${SCHEDULER}_adamw_wd1e-03_${MAX_N_SEGMENTS}x${SEGMENT_SIZE}_mem${MEMORY_SIZE}_bs${TBS}_bptt-${K2}-from_hf/run_$N \
+        --from_pretrained $FROM_PRETRAINED \
         --model_type $MODEL_TYPE \
         --model_cls $BACKBONE_CLS \
         --segment_size $SEGMENT_SIZE \
